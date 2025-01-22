@@ -371,9 +371,14 @@ class MeteoraDLMMSniper {
         try {
             const pool = await DynamicAmm.create(this.connection, testPool);
             console.log("\n✅ Pool loading test passed:");
-            console.log("Pool address:", pool.publicKey.toBase58());
+            console.log("Pool address:", testPool.toBase58());
             console.log("Token A:", pool.tokenAMint.address.toBase58());
             console.log("Token B:", pool.tokenBMint.address.toBase58());
+            
+            // Display pool info
+            const { tokenAAmount, tokenBAmount } = pool.poolInfo;
+            console.log("Token A amount:", tokenAAmount.toString());
+            console.log("Token B amount:", tokenBAmount.toString());
         } catch (err) {
             console.error("❌ Pool loading test failed:", err);
             return;
@@ -410,15 +415,14 @@ class MeteoraDLMMSniper {
         console.log("\n✅ All tests passed! Sniper is ready to run.");
     }
 }
-}
 
 // Command line argument handling
 function parseArgs() {
-const args = process.argv.slice(2);
-return {
-    test: args.includes('--test'),
-    help: args.includes('--help') || args.includes('-h')
-};
+    const args = process.argv.slice(2);
+    return {
+        test: args.includes('--test'),
+        help: args.includes('--help') || args.includes('-h')
+    };
 }
 
 function showHelp() {
