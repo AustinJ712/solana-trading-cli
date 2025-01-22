@@ -32,7 +32,7 @@ program.parse();
  * @param {number} no_of_sol - The amount of SOL to trade.
  * @returns {Promise<void>} - A promise that resolves when the swap is completed.
  */
-async function buy(side:string, token_address:string, no_of_sol:number) {
+async function buy(side: "buy" | "sell", token_address: string, no_of_sol: number) {
   await swap(side, token_address, no_of_sol, -1);
 }
 buy("buy", token, sol);
