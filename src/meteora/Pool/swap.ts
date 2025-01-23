@@ -1,104 +1,88 @@
 import { PublicKey, VersionedTransaction, TransactionMessage } from "@solana/web3.js";
 import BN from "bn.js";
-import { fetchDynamicAmmPool } from "./fetch-pool";
+import { fetchDLMMPool } from "./fetch-pool";
 import { connection, wallet, jito_fee } from "../../helpers/config";
 import { getSPLTokenBalance } from "../../helpers/check_balance";
 import { jito_executeAndConfirm } from "../../transactions/jito_tips_tx_executor";
+import { getOrCreateAssociatedTokenAccount, NATIVE_MINT } from "@solana/spl-token";
 
 /**
- * Performs a swap in a given Meteora dynamic-amm pool,
- * either "buy" (use SOL) or "sell" (sell your token).
- *
- * @param side "buy" or "sell"
- * @param tokenAddress The mint address of the token
- * @param buyAmountInSOL If side is "buy", how many SOL to spend
- * @param sellPercentage If side is "sell", how many % to sell
+ * Performs a swap operation in a DLMM pool.
+ * @param tokenAddress The address of the token to be swapped.
+ * @param amountIn The amount of input token (in SOL or USDC) to be used for buying.
+ * @param isUsdc Whether to use USDC (true) or SOL (false) as input token.
  */
-export async function swap(
-  side: "buy" | "sell",
+export async function flexSwap(
   tokenAddress: string,
-  buyAmountInSOL = 0.1,
-  sellPercentage = 100
+  amountIn: number,
+  isUsdc: boolean = false
 ) {
-  // 1) fetch the dynamic amm pool
-  const dynamicPool = await fetchDynamicAmmPool(tokenAddress);
-  const poolInfo = dynamicPool.poolInfo;
+  const dlmmPool = await fetchDLMMPool(tokenAddress);
+  const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  const WSOL = 'So11111111111111111111111111111111111111112';
 
-  // Print initial pool state
-  console.log(
-    'tokenA %s Amount: %s',
-    dynamicPool.tokenAMint.address,
-    poolInfo.tokenAAmount.toNumber() / Math.pow(10, dynamicPool.tokenAMint.decimals)
-  );
-  console.log(
-    'tokenB %s Amount: %s',
-    dynamicPool.tokenBMint.address,
-    poolInfo.tokenBAmount.toNumber() / Math.pow(10, dynamicPool.tokenBMint.decimals)
-  );
-
-  let swapAmountLamports: BN;
-  let swapInToken, swapOutToken;
+  let inToken: PublicKey, outToken: PublicKey, swapAmount: BN;
+  const inputTokenAddr = isUsdc ? USDC : WSOL;
 
   // Determine swap direction and tokens
-  const isTokenAWsol = dynamicPool.tokenAMint.address.toString() === "So11111111111111111111111111111111111111112";
-  if (side === "buy") {
-    // For buy, we're using SOL to buy the other token
-    swapInToken = isTokenAWsol ? dynamicPool.tokenAMint : dynamicPool.tokenBMint;
-    swapOutToken = isTokenAWsol ? dynamicPool.tokenBMint : dynamicPool.tokenAMint;
-    swapAmountLamports = new BN(Math.floor(buyAmountInSOL * 1e9));
+  let swapYtoX = true; // Default to Y->X swap
+  if (dlmmPool.tokenY.publicKey.toBase58() === inputTokenAddr) {
+    inToken = dlmmPool.tokenY.publicKey;
+    outToken = dlmmPool.tokenX.publicKey;
+    swapYtoX = true; // Swapping from Y to X
   } else {
-    // For sell, we're selling the token for SOL
-    swapInToken = isTokenAWsol ? dynamicPool.tokenBMint : dynamicPool.tokenAMint;
-    swapOutToken = isTokenAWsol ? dynamicPool.tokenAMint : dynamicPool.tokenBMint;
-    // Calculate sell amount based on balance
-    const balance = await getSPLTokenBalance(connection, new PublicKey(swapInToken.address), wallet.publicKey);
-    const toSell = balance * (sellPercentage / 100);
-    swapAmountLamports = new BN(toSell * 10 ** swapInToken.decimals);
+    inToken = dlmmPool.tokenX.publicKey;
+    outToken = dlmmPool.tokenY.publicKey;
+    swapYtoX = false; // Swapping from X to Y
   }
 
-  // Get swap quote with 1% slippage
-  const swapQuote = dynamicPool.getSwapQuote(
-    new PublicKey(swapInToken.address),
-    swapAmountLamports,
-    100
+  // Convert amount based on input token decimals
+  const decimals = isUsdc ? 6 : 9;
+  swapAmount = new BN(amountIn * 10 ** decimals);
+
+  // Get quote and execute swap
+  const binArrays = await dlmmPool.getBinArrayForSwap(swapYtoX);
+  const swapQuote = await dlmmPool.swapQuote(
+    swapAmount,
+    swapYtoX,
+    new BN(10),
+    binArrays
   );
 
-  console.log(
-    'Swap In %s, Amount %s',
-    swapInToken.address,
-    swapQuote.swapInAmount.toNumber() / Math.pow(10, swapInToken.decimals)
-  );
-  console.log(
-    'Swap Out %s, Amount %s',
-    swapOutToken.address,
-    swapQuote.swapOutAmount.toNumber() / Math.pow(10, swapOutToken.decimals)
-  );
-  console.log('Price Impact: %s', swapQuote.priceImpact);
+  const swapTx = await dlmmPool.swap({
+    inToken,
+    binArraysPubkey: swapQuote.binArraysPubkey,
+    inAmount: swapAmount,
+    lbPair: dlmmPool.pubkey,
+    user: wallet.publicKey,
+    minOutAmount: swapQuote.minOutAmount,
+    outToken,
+  });
 
-  // Execute swap
-  const swapTx = await dynamicPool.swap(
-    wallet.publicKey,
-    new PublicKey(swapInToken.address),
-    swapAmountLamports,
-    swapQuote.minSwapOutAmount
-  );
+  // Execute transaction
+  try {
+    const recentBlockhash = await connection.getLatestBlockhash();
+    const messageV0 = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: recentBlockhash.blockhash,
+      instructions: [...swapTx.instructions],
+    }).compileToV0Message();
 
-  // Build and send transaction
-  const recentBlockhash = await connection.getLatestBlockhash();
-  const messageV0 = new TransactionMessage({
-    payerKey: wallet.publicKey,
-    recentBlockhash: recentBlockhash.blockhash,
-    instructions: swapTx.instructions
-  }).compileToV0Message();
-  
-  const transaction = new VersionedTransaction(messageV0);
-  transaction.sign([wallet]);
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([wallet]);
+    const res = await jito_executeAndConfirm(
+      transaction,
+      wallet,
+      recentBlockhash,
+      jito_fee
+    );
 
-  // Send via Jito
-  const result = await jito_executeAndConfirm(transaction, wallet, recentBlockhash, jito_fee);
-  if (result.confirmed) {
-    console.log(`Swap success: https://solscan.io/tx/${result.signature}`);
-  } else {
-    console.error("Swap failed or not confirmed");
+    if (res.confirmed) {
+      console.log(`🚀 https://solscan.io/tx/${res.signature}`);
+      return res.signature;
+    }
+  } catch (error) {
+    console.error("Swap failed:", error);
+    throw error;
   }
 }

@@ -12,7 +12,7 @@ import { BN } from "bn.js";
 import { loadEnv } from "../utils/load-env";
 import { connection } from "../helpers/config";
 import DynamicAmm from "@mercurial-finance/dynamic-amm-sdk";
-import { createAndSendV0Tx } from "./execute-txns";
+import { createAndSendV0Tx } from "./execute-txns2";
 
 // Constants for token mints we're interested in
 const SOL_MINT_STR = "So11111111111111111111111111111111111111112";
@@ -125,6 +125,8 @@ export function meteoraSuperSniper() {
           return;
         }
 
+        // Only rummage if the transaction itself created brand new accounts
+        // We'll check each dynamic-amm candidate pool to see if its preBalance == 0
         await rummageForPools(signature, txDetails);
       } else {
         console.log("⚠️ Unhandled message", msg);
@@ -149,7 +151,10 @@ export function meteoraSuperSniper() {
 /**
  * Check each static account in the transaction to see if it's a newly created dynamic-amm pool.
  */
-async function rummageForPools(signature: string, txn: VersionedTransactionResponse) {
+async function rummageForPools(
+  signature: string,
+  txn: VersionedTransactionResponse
+) {
   if (!txn.meta || txn.meta.err) {
     console.log("❌ Transaction failed or missing meta:", signature);
     return;
@@ -160,11 +165,19 @@ async function rummageForPools(signature: string, txn: VersionedTransactionRespo
 
   let foundPool = false;
 
-  for (const key of acctKeys) {
+  for (let i = 0; i < acctKeys.length; i++) {
+    const key = acctKeys[i];
     try {
+      // Check if preBalances[i] was zero => brand new account in this tx
+      if (txn.meta.preBalances[i] !== 0) {
+        // This account wasn't newly created, skip it
+        continue;
+      }
+
+      // Attempt to create a dynamic-amm instance
       const maybePool = await DynamicAmm.create(connection, key);
       if (maybePool?.poolInfo) {
-        console.log("\n🏦 Found dynamic-amm pool:", key.toBase58());
+        console.log("\n🏦 Found dynamic-amm pool (brand new):", key.toBase58());
         foundPool = true;
         await analyzePool(maybePool);
       }
@@ -215,9 +228,9 @@ async function analyzePool(dynamicPool: any) {
   if (hasSol) {
     solEq = mintA === SOL_MINT_STR ? humA : humB;
   } else {
-    // USDC side - do a rough 1 USDC = 0.05 SOL, adjust as needed
+    // USDC side - do a rough 1 USDC = 0.5 SOL, etc.
     const usdcSide = mintA === USDC_MINT_STR ? humA : humB;
-    solEq = usdcSide / 2; // (example ratio)
+    solEq = usdcSide / 2;
   }
 
   if (solEq < SETTINGS.minLiquidityInSOL) {
@@ -256,17 +269,7 @@ async function snipePool(dynamicPool: any) {
     console.log(`- Amount: ${poolInfo.tokenBAmount.toString()}`);
     console.log(`- Decimals: ${tokenBMint.decimals}`);
 
-    // Quick check for extremely low liquidity
-    const minLiquidityThreshold = new BN(10);
-    if (
-      poolInfo.tokenAAmount.lt(minLiquidityThreshold) ||
-      poolInfo.tokenBAmount.lt(minLiquidityThreshold)
-    ) {
-      console.log("❌ Pool liquidity too low - skipping");
-      return;
-    }
-
-    // Attempt the swap directly
+    // Attempt the swap
     const buyLamports = new BN(SETTINGS.swapAmountInSOL * LAMPORTS_PER_SOL);
     console.log(`\n💱 Attempting swap of ${SETTINGS.swapAmountInSOL} SOL`);
 
@@ -276,15 +279,16 @@ async function snipePool(dynamicPool: any) {
       SETTINGS.slippageBps
     );
 
-    // If negative, clamp to zero
+    // Clamp negative minOut to 0
     const minOut = swapQuote.minSwapOutAmount.gte(new BN(0))
       ? swapQuote.minSwapOutAmount
       : new BN(0);
 
-    // Price impact check
     const priceImpactNum = Number(swapQuote.priceImpact) || 0;
     if (priceImpactNum > SETTINGS.maxPriceImpact) {
-      console.log(`❌ Price impact too high: ${priceImpactNum}% > ${SETTINGS.maxPriceImpact}%`);
+      console.log(
+        `❌ Price impact too high: ${priceImpactNum}% > ${SETTINGS.maxPriceImpact}%`
+      );
       return;
     }
 

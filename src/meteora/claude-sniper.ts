@@ -17,23 +17,30 @@ import {
 import bs58 from "bs58";
 import BN from "bn.js";
 import DynamicAmm from "@mercurial-finance/dynamic-amm-sdk";
-import { createAndSendV0Tx } from "./execute-txns";
+import { createAndSendV0Tx } from "./execute-txns2";
 import retry from "async-retry";
+
+// Load environment variables first
+loadEnv();
 
 // Constants
 export const DYNAMIC_AMM_PROGRAM_ID = new PublicKey("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB");
 const SOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+const TARGET_TOKEN_ADDRESS = new PublicKey("FhAM574jFUY2pkxdkpLFGH9X4mDuUScuQirHsTJETJB9");
+const MAINNET_ENDPOINT = "https://mainnet.helius-rpc.com/?api-key=e7a0fa4f-35a0-44b0-abcc-67b82875b2df";
+const HELIUS_API_KEY = "e7a0fa4f-35a0-44b0-abcc-67b82875b2df";
+const PRIVATE_KEY = "4GYnnYLEwLBxNucU4PMSk7awiwDMoAgxraCHj1AoBVomJcJYMhqUvCbP2s2v7Xz5dNwGJ6zNbRLLpfDiDj9zq3mC";
 
 // Connection and wallet setup
 let processedTxCount = 0;
 
 // Settings from environment
 const SETTINGS = {
-    swapAmountInSOL: process.env.SWAP_AMOUNT_SOL ? parseFloat(process.env.SWAP_AMOUNT_SOL) : 0.1,
-    minLiquidityInSOL: process.env.MIN_LIQUIDITY_SOL ? parseFloat(process.env.MIN_LIQUIDITY_SOL) : 0.0001,
-    maxPriceImpact: process.env.MAX_PRICE_IMPACT ? parseFloat(process.env.MAX_PRICE_IMPACT) : 50,
-    slippageBps: process.env.SLIPPAGE_BPS ? parseInt(process.env.SLIPPAGE_BPS) : 1000,
+    swapAmountInSOL: process.env.SWAP_AMOUNT_SOL ? parseFloat(process.env.SWAP_AMOUNT_SOL) : 0.01,
+    minLiquidityInSOL: process.env.MIN_LIQUIDITY_SOL ? parseFloat(process.env.MIN_LIQUIDITY_SOL) : 0.0,
+    maxPriceImpact: process.env.MAX_PRICE_IMPACT ? parseFloat(process.env.MAX_PRICE_IMPACT) : 100,
+    slippageBps: process.env.SLIPPAGE_BPS ? parseInt(process.env.SLIPPAGE_BPS) : 10000,
     usdcPerSol: 20,  // Rough estimate, can be updated with real price feed
     retryAttempts: 3,
     retryDelay: 100,
@@ -60,7 +67,7 @@ class MeteoraDLMMSniper {
             console.log(`Swap amount: ${SETTINGS.swapAmountInSOL} SOL`);
             console.log(`Min liquidity: ${SETTINGS.minLiquidityInSOL} SOL`);
             console.log(`Max price impact: ${SETTINGS.maxPriceImpact}%`);
-            console.log(`Slippage: ${SETTINGS.slippageBps / 100}%`);
+            console.log(`Slippage: ${SETTINGS.slippageBps / 10000}%`);
             console.log(`Wallet: ${this.sniperKeypair.publicKey.toBase58()}\n`);
             this.initialized = true;
         }
@@ -366,23 +373,8 @@ class MeteoraDLMMSniper {
             return;
         }
 
-        // Test pool loading
-        const testPool = new PublicKey(process.env.TEST_POOL_ADDRESS!);
-        try {
-            const pool = await DynamicAmm.create(this.connection, testPool);
-            console.log("\n✅ Pool loading test passed:");
-            console.log("Pool address:", testPool.toBase58());
-            console.log("Token A:", pool.tokenAMint.address.toBase58());
-            console.log("Token B:", pool.tokenBMint.address.toBase58());
-            
-            // Display pool info
-            const { tokenAAmount, tokenBAmount } = pool.poolInfo;
-            console.log("Token A amount:", tokenAAmount.toString());
-            console.log("Token B amount:", tokenBAmount.toString());
-        } catch (err) {
-            console.error("❌ Pool loading test failed:", err);
-            return;
-        }
+        // Test pool search
+        await this.testPoolSearch();
 
         // Test wallet balance
         try {
@@ -413,6 +405,45 @@ class MeteoraDLMMSniper {
         }
 
         console.log("\n✅ All tests passed! Sniper is ready to run.");
+    }
+
+    async testPoolSearch() {
+        console.log("🔍 Searching for existing DLMM pools with target token...");
+        console.log(`Target token: ${this.targetMint.toBase58()}`);
+
+        try {
+            // Use Meteora's API to find pools
+            const url = `https://dlmm-api.meteora.ag/pair/all_by_groups?sort_key=tvl&order_by=desc&search_term=${this.targetMint.toBase58()}&include_unknown=false`;
+            
+            console.log("Querying Meteora API...");
+            const response = await (await fetch(url)).json();
+            
+            if (!response.groups || response.groups.length === 0) {
+                console.log("❌ No existing pools found with target token");
+                return;
+            }
+
+            console.log(`\n✅ Found pools containing target token:\n`);
+            
+            for (const group of response.groups) {
+                console.log(`Group: ${group.name}`);
+                for (const pair of group.pairs) {
+                    console.log(`Pool Address: ${pair.address}`);
+                    console.log(`Base: ${pair.base_token_symbol} (${pair.base_token_address})`);
+                    console.log(`Quote: ${pair.quote_token_symbol} (${pair.quote_token_address})`);
+                    console.log(`TVL: $${pair.tvl.toLocaleString()}`);
+                    console.log(`24h Volume: $${pair.volume_24h.toLocaleString()}\n`);
+
+                    // Load actual pool data
+                    const pool = await DynamicAmm.create(this.connection, new PublicKey(pair.address));
+                    const { tokenAAmount, tokenBAmount } = pool.poolInfo;
+                    console.log(`Current Reserves: ${tokenAAmount.toString()} / ${tokenBAmount.toString()}\n`);
+                }
+            }
+
+        } catch (err) {
+            console.error("❌ Pool search failed:", err);
+        }
     }
 }
 
@@ -445,39 +476,32 @@ QUOTE_MINT            'WSOL' or 'USDC' to force quote token
 }
 
 if (require.main === module) {
-loadEnv();
+    const args = parseArgs();
 
-const args = parseArgs();
-
-if (args.help) {
-    showHelp();
-    process.exit(0);
-}
-
-if (!process.env.TARGET_TOKEN_ADDRESS) {
-    console.error("❌ No TARGET_TOKEN_ADDRESS specified in .env");
-    process.exit(1);
-}
-
-const connection = new Connection(process.env.MAINNET_ENDPOINT!, {
-    commitment: "confirmed"
-});
-
-const sniper = new MeteoraDLMMSniper(
-    connection,
-    Keypair.fromSecretKey(bs58.decode(process.env.SWAP_PRIVATE_KEY!)),
-    `wss://atlas-mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
-    new PublicKey(process.env.TARGET_TOKEN_ADDRESS)
-);
-
-if (args.test) {
-    sniper.testMode();
-} else {
-    sniper.start();
-    
-    process.on("SIGINT", () => {
-        console.log("\n👋 Shutting down gracefully...");
+    if (args.help) {
+        showHelp();
         process.exit(0);
+    }
+
+    const connection = new Connection(MAINNET_ENDPOINT, {
+        commitment: "confirmed"
     });
-}
+
+    const sniper = new MeteoraDLMMSniper(
+        connection,
+        Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY)),
+        `wss://atlas-mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+        TARGET_TOKEN_ADDRESS
+    );
+
+    if (args.test) {
+        sniper.testMode();
+    } else {
+        sniper.start();
+        
+        process.on("SIGINT", () => {
+            console.log("\n👋 Shutting down gracefully...");
+            process.exit(0);
+        });
+    }
 }

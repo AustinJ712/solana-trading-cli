@@ -1,112 +1,144 @@
 /**
- * super-sniper-dynamicamm.ts
+ * o1-sniper.ts
  *
- * Listens for new pools created by the Meteora DLMM (dynamic-liquidity market making) program
- * and immediately attempts to swap (buy) the target token using either SOL or USDC,
- * reading from environment variables in .env.
+ * Listens via Helius websockets for new "Initialize LBPair" instructions from the Meteora DLMM
+ * program. Two modes:
  *
- * In this version, we specifically focus on DLMM pools — that is, the Meteora "dlmm-sdk"
- * load address. We detect the "initialize pool" instruction and parse the new
- * pool address (for example, from logs, postTokenBalances, or the program's `PoolCreated` event).
- * Once we find that new DLMM pool, if it includes our target token and the other side is SOL or USDC,
- * we snipe it immediately.
+ *  1) **Normal mode**: Checks if the new pool includes your TARGET_TOKEN_ADDRESS paired with USDC or SOL,
+ *     and immediately executes a swap using your sniper wallet.
+ *  2) **Test mode** (`--test`): Ignores the TARGET_TOKEN_ADDRESS. Instead, it buys whichever token
+ *     is paired with USDC or SOL in the newly launched pool (the "unknown" token side).
+ *
+ * In both modes, a mandatory 0.01 SOL tip is sent to a randomly chosen Jito validator as part
+ * of the bundle. This uses Jito's `sendBundle()` for a near-zero block snipe, integrates with
+ * `execute-txns-meteora.ts` for wrapping SOL/creating ATAs, and references the official DLMM
+ * SDK for the actual swap logic.
+ *
+ *   - jito/send-bundle.ts              => to send transactions as a Jito bundle
+ *   - meteora/execute-txns-meteora.ts  => for creating ATA, wrap SOL if needed
+ *   - meteora/Pool/fetch-pool.ts       => example fetchDLMMPool or DLMM.create
+ *   - .env                             => environment variables
  */
 
-import 'dotenv/config'; // For reading .env
+import 'dotenv/config';
 import WebSocket from 'ws';
 import {
   Connection,
   Keypair,
   PublicKey,
-  LAMPORTS_PER_SOL,
-  Transaction,
-  SystemProgram,
+  VersionedTransaction,
   TransactionInstruction,
+  TransactionMessage,
+  SystemProgram,
+  LAMPORTS_PER_SOL
 } from '@solana/web3.js';
+
 import bs58 from 'bs58';
-import { BN } from 'bn.js';
+import BN from 'bn.js';
 
-// SPL helpers for ATA creation (fixes swap failures due to missing associated token accounts)
+// Official DLMM (meteora-ag/dlmm) imports
+import DLMM from '@meteora-ag/dlmm';
+
+// Local code references (adjust paths as needed)
+import { sendBundle } from '../jito/send-bundle';                // your actual path
+import type { BlockhashWithExpiryBlockHeight } from './execute-txns-meteora';  // your local file
 import {
-  getOrCreateAssociatedTokenAccount,
-  NATIVE_MINT,
-  createSyncNativeInstruction,
-  createCloseAccountInstruction,
-} from '@solana/spl-token';
+  createWrapSolInstructions,
+  getOrCreateMeteoraAta,
+} from './execute-txns-meteora';
 
-// Import the official DLMM TS client from your local or npm
-import DLMM, { SwapQuote } from '@meteora-ag/dlmm';
+/** 
+ * Parse CLI args to see if we're in --test mode.
+ */
+function parseCliArgs() {
+  const args = process.argv.slice(2);
+  return {
+    isTestMode: args.includes('--test'),
+  };
+}
 
-// Some constants from the TS client if needed
+//////////////////////////////////////////////////////////////////////////////////////
+// ENV + Config
+//////////////////////////////////////////////////////////////////////////////////////
 
-///////////////////////////////////////////////////////////////////////////////////
-// ENV variables
-///////////////////////////////////////////////////////////////////////////////////
-const NETWORK_ENV = process.env.NETWORK || 'mainnet'; // 'mainnet' or 'devnet'
-const MAINNET_ENDPOINT = process.env.MAINNET_ENDPOINT || 'https://api.mainnet-beta.solana.com';
-const DEVNET_ENDPOINT  = process.env.DEVNET_ENDPOINT  || 'https://api.devnet.solana.com';
+// Choose cluster from env, default to mainnet
+const NETWORK_ENV = process.env.NETWORK || 'mainnet';  
+const MAINNET_ENDPOINT = process.env.MAINNET_ENDPOINT || 'https://api.mainnet-beta.solana.com';  
+const DEVNET_ENDPOINT  = process.env.DEVNET_ENDPOINT  || 'https://api.devnet.solana.com';  
 
+// The cluster-specific RPC endpoint
 const RPC_ENDPOINT = (NETWORK_ENV === 'devnet') ? DEVNET_ENDPOINT : MAINNET_ENDPOINT;
 
-// Helius websockets for mainnet, or your own aggregator:
-const WS_MAINNET_ENDPOINT = process.env.WS_MAINNET_ENDPOINT || 'wss://mainnet.helius-rpc.com/?api-key=XXXX';
+/**
+ * IMPORTANT: 
+ *   We must use the Helius "atlas" (or "geyser") aggregator WebSocket endpoint
+ *   in order to use "transactionSubscribe" successfully. The standard 
+ *   wss://mainnet.helius-rpc.com does NOT support it.
+ */
+const WS_ENDPOINT = 'wss://atlas-mainnet.helius-rpc.com/?api-key=e7a0fa4f-35a0-44b0-abcc-67b82875b2df';
 
-// This is your sniping keypair that holds SOL or USDC to do the snipe
+// The sniper wallet that holds SOL or USDC to buy the target token
 const SNIPER_PRIVATE_KEY_B58 = process.env.SWAP_PRIVATE_KEY || process.env.PRIVATE_KEY;
 if (!SNIPER_PRIVATE_KEY_B58) {
-  throw new Error('No SWAP_PRIVATE_KEY or PRIVATE_KEY found in .env');
+  throw new Error('Missing SWAP_PRIVATE_KEY (or PRIVATE_KEY) in .env');
 }
 const SNIPER_KEYPAIR = Keypair.fromSecretKey(bs58.decode(SNIPER_PRIVATE_KEY_B58));
 
-// Your target token from .env:
+// The target token we want to buy on new pool creation (ignored in test mode)
 const TARGET_TOKEN_ADDRESS = process.env.TARGET_TOKEN_ADDRESS;
 if (!TARGET_TOKEN_ADDRESS) {
-  throw new Error('No TARGET_TOKEN_ADDRESS provided in .env');
+  throw new Error('No TARGET_TOKEN_ADDRESS in .env');
 }
 const TARGET_TOKEN_MINT = new PublicKey(TARGET_TOKEN_ADDRESS);
-console.log(`🎯 Target token to snipe: ${TARGET_TOKEN_ADDRESS}`);
 
-// Decide whether we're forcing SOL or letting USDC be used
-// If QUOTE_MINT=WSOL => we force SOL, otherwise prefer USDC
-const FORCE_SOL = (process.env.QUOTE_MINT === 'WSOL');
+// Amount to spend if the pool side is USDC or SOL
+const QUOTE_AMOUNT_USDC = parseFloat(process.env.QUOTE_AMOUNT_USDC || '5');   // e.g. 5 USDC
+const QUOTE_AMOUNT_SOL  = parseFloat(process.env.QUOTE_AMOUNT_SOL  || '0.05'); // e.g. 0.05 SOL
 
-// The buy amount in USDC (or SOL if the pool only has SOL or if forcing SOL)
-const QUOTE_AMOUNT = parseFloat(process.env.QUOTE_AMOUNT || '5');
-
-// Slippage in BPS (e.g. 100 => 1%)
+// Slippage in BPS
 const SNIPE_SLIPPAGE_BPS = parseInt(process.env.SNIPE_SLIPPAGE_BPS || '10000');
 
-// Minimum liquidity threshold in SOL equivalent (optional)
+// Minimal approximate liquidity requirement in SOL
 const MIN_LIQUIDITY_SOL = parseFloat(process.env.MIN_LIQUIDITY_SOL || '0.001');
 
-// If we do USDC, specify the mainnet mint
+// The LB CLMM (DLMM) program ID on mainnet
+const DLMM_PROGRAM_ID = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
+
+// Standard USDC + WSOL Mints
 const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+const SOL_MINT  = new PublicKey('So11111111111111111111111111111111111111112');
 
-// The canonical WSOL mint
-const SOL_MINT = new PublicKey('So11111111111111111111111111111111111111112');
+// We always tip 0.01 SOL in the Jito bundle
+const TIP_LAMPORTS = Math.floor(0.01 * LAMPORTS_PER_SOL);
 
-/**
- * The official LB-CLMM (DLMM) program ID can differ based on cluster. The TS client
- * typically uses an internal mapping, e.g. LBCLMM_PROGRAM_IDS[cluster].
- * If needed, you could do so here.
- */
-// For demonstration, we assume the user wants to detect new dlmm pools from their known program ID.
-const DLMM_PROGRAM_ID = 'LbVRzDTvBDEcrthxfZ4RL6yiq3uZw8bS6MwtdY6UhFQ'; // example placeholder
+// A few known Jito validator addresses from mainnet to pick from randomly
+const JITO_VALIDATORS = [
+  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
+  'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
+  '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
+  'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
+];
+function pickRandomJitoValidator(): PublicKey {
+  const index = Math.floor(Math.random() * JITO_VALIDATORS.length);
+  return new PublicKey(JITO_VALIDATORS[index]);
+}
 
-///////////////////////////////////////////////////////////////////////////////////
-// Minimal shape of Helius realtime message
-///////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////
+// Minimal shape for Helius transaction objects
+//////////////////////////////////////////////////////////////////////////////////////
+
 interface HeliusTransaction {
   meta: {
     err: any;
-    postTokenBalances?: any[];
     preTokenBalances?: any[];
+    postTokenBalances?: any[];
+    logMessages?: string[];
   };
   transaction: {
     message: {
       instructions: Array<{
         programId: string;
-        data: string; // base58-encoded instruction data
+        data: string;
         accounts?: string[];
       }>;
     };
@@ -116,7 +148,11 @@ interface HeliusTransaction {
 
 interface HeliusRealtimeMessage {
   jsonrpc: string;
-  method: string; // "transactionNotify", "transactionNotification", etc
+  method: string;
+  error?: {
+    code: number;
+    message: string;
+  };
   params: {
     result: HeliusTransaction;
     subscription: number;
@@ -124,30 +160,61 @@ interface HeliusRealtimeMessage {
   id?: string | number;
 }
 
-///////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////
 
-export class DlmmPoolSniper {
+export class O1DlmmSniper {
   private ws: WebSocket | null = null;
   private connection: Connection;
-  private processedTxCount: number = 0;
+  private processedTxCount = 0;
+  private processedPools: Set<string> = new Set();
+  private isTestMode: boolean;
 
-  constructor(private rpcURL: string, private wsUrl: string) {
-    this.connection = new Connection(rpcURL, 'confirmed');
+  constructor(
+    private rpcUrl: string,
+    private wsUrl: string,
+    isTestMode: boolean
+  ) {
+    this.connection = new Connection(this.rpcUrl, 'confirmed');
+    this.isTestMode = isTestMode;
   }
 
+  /**
+   * Start the sniper: open WS subscription to the Helius aggregator, watch for 
+   * "initialize LBPair" instructions from the DLMM program, parse the new pool 
+   * address, check conditions, then do a Jito-based bundle swap.
+   */
   public start() {
-    console.log(`🚀 Starting DLMM sniper on ${NETWORK_ENV}, using RPC: ${this.rpcURL}`);
+    console.log(`\n==== Meteora DLMM Pool Sniper ====\n`);
+    console.log(`Environment: ${NETWORK_ENV}`);
+    console.log(`RPC Endpoint: ${this.rpcUrl}`);
+    console.log(`WebSocket Endpoint: ${this.wsUrl}`);
     console.log(`Sniper wallet: ${SNIPER_KEYPAIR.publicKey.toBase58()}`);
-    console.log(`WS endpoint: ${this.wsUrl}`);
-    console.log(`Will swap with ${FORCE_SOL ? 'SOL' : 'USDC'} for target token: ${TARGET_TOKEN_ADDRESS}`);
-    console.log(`Quote amount: ${QUOTE_AMOUNT}, slippage BPS: ${SNIPE_SLIPPAGE_BPS}, min liquidity: ${MIN_LIQUIDITY_SOL}\n`);
+    console.log(`Test mode? ${this.isTestMode}`);
 
+    if (!this.isTestMode) {
+      console.log(`Target token (to buy): ${TARGET_TOKEN_MINT.toBase58()}`);
+    } else {
+      console.log(`(Test mode: ignoring TARGET_TOKEN_ADDRESS, just buy any new token with USDC/SOL side)`);
+    }
+
+    console.log(`USDC buy amount: ${QUOTE_AMOUNT_USDC}, SOL buy amount: ${QUOTE_AMOUNT_SOL}`);
+    console.log(`Slippage (BPS): ${SNIPE_SLIPPAGE_BPS}`);
+    console.log(`Min pool liquidity (approx SOL eq): ${MIN_LIQUIDITY_SOL}`);
+    console.log(`Mandatory Jito tip: 0.01 SOL\n`);
+
+    this.initWebSocket();
+  }
+
+  /**
+   * Initialize the WebSocket connection to Helius aggregator (atlas).
+   * We'll subscribe to any transaction referencing the DLMM program ID.
+   */
+  private initWebSocket() {
     this.ws = new WebSocket(this.wsUrl);
 
     this.ws.on('open', () => {
-      console.log('✅ WebSocket connected for dlmm sniper');
+      console.log('WebSocket connected to Helius aggregator. Subscribing to DLMM transactions...\n');
 
-      // We subscribe to the known DLMM program ID
       const subscription = {
         jsonrpc: '2.0',
         id: 1,
@@ -155,405 +222,385 @@ export class DlmmPoolSniper {
         params: [
           {
             accountInclude: [DLMM_PROGRAM_ID],
-            failed: false
+            failed: false,
           },
           {
             commitment: 'confirmed',
             maxSupportedTransactionVersion: 0,
             transactionDetails: 'full'
           }
-        ],
+        ]
       };
+
       this.ws!.send(JSON.stringify(subscription));
-      console.log('Listening for new DLMM pool transactions...');
+      console.log('Subscription request sent. Waiting for messages...');
     });
 
-    this.ws.on('message', async (data) => {
+    this.ws.on('message', async (data: any) => {
       try {
-        const msg = JSON.parse(data.toString()) as HeliusRealtimeMessage;
-        if (!msg.params || !msg.params.result) return;
+        const rawStr = data.toString();
+        const msg = JSON.parse(rawStr) as HeliusRealtimeMessage;
 
-        const { transaction, meta, signature } = msg.params.result;
-        if (meta.err) return; // skip failed TXs
-
-        this.processedTxCount++;
-        if (this.processedTxCount % 100 === 0) {
-          console.log(`Processed ${this.processedTxCount} dlmm tx so far...`);
-        }
-
-        // Possibly detect "initializeCustomizablePermissionlessLbPair" or "initializeLbPair" instructions
-        const dlmmProgramId = DLMM_PROGRAM_ID;
-        const initPoolIx = transaction.message.instructions.find((ix) => {
-          return ix.programId === dlmmProgramId;
-          // Additional logic could decode the data to confirm it's the correct init pool instruction
-        });
-        if (!initPoolIx) {
-          // Not a new pool creation
+        if (msg.error) {
+          console.error('❌ Subscription error from Helius:', msg.error);
           return;
         }
 
+        // Make sure we have params and result
+        if (!msg.params || !msg.params.result) {
+          // Not a transaction notify
+          return;
+        }
+
+        // Safely access meta and check for errors
+        const { transaction, meta } = msg.params.result;
+        if (!transaction || !meta) {
+          return;
+        }
+
+        this.processedTxCount++;
+        if (this.processedTxCount % 20 === 0) {
+          console.log(`Processed ${this.processedTxCount} referencing-DLMM txs so far...`);
+        }
+
+        // Now safely check meta.err
+        if (meta.err) {
+          // skip failed TXs if we don't care
+          return;
+        }
+
+        // Check if there's an init instruction for LBPair
+        const dlmmIx = transaction.message.instructions.find(ix => ix.programId === DLMM_PROGRAM_ID);
+        if (!dlmmIx) {
+          // not a LBPair init, skip
+          return;
+        }
+
+        console.log(`\n🌟 Found a TX with LBPair init instruction!`);
         await this.handleNewPool(msg.params.result);
+
       } catch (err) {
-        console.error('WS message parse error', err);
+        console.error('Error while parsing WS message =>', err);
       }
     });
 
     this.ws.on('close', () => {
-      console.log('❌ WebSocket closed, reconnecting in 5s...');
-      setTimeout(() => this.start(), 5000);
+      console.error('WebSocket closed. Will reconnect in 5s...');
+      setTimeout(() => this.initWebSocket(), 5000);
     });
 
     this.ws.on('error', (err) => {
-      console.error('⚠️ WebSocket error:', err);
+      console.error('WS error =>', err);
     });
   }
 
   /**
-   * Attempt to parse the newly created LB pair address from the transaction.
-   * Then check if it includes the target token with SOL or USDC.
-   * If it meets liquidity requirements, do a swap.
+   * handleNewPool: parse the newly created LB pair address, create the DLMM instance,
+   * check if it meets our buy conditions, then do the swap if so.
    */
   private async handleNewPool(txInfo: HeliusTransaction) {
-    const { transaction, meta, signature } = txInfo;
     try {
-      // We'll do a placeholder for demonstration — parse logs or postTokenBalances to find the new pool
+      // Log raw transaction details
+      console.log('\n------------------------------------');
+      console.log(`New transaction referencing LBCLMM => Sig: ${txInfo.signature}`);
+
+      // Print transaction logs if available
+      if (txInfo.meta?.logMessages) {
+        console.log('\nLog Messages:');
+        for (const log of txInfo.meta.logMessages) {
+          console.log('   ', log);
+        }
+      }
+
+      // Print instruction details if available
+      if (txInfo.transaction?.message?.instructions) {
+        console.log('\nInstructions:');
+        for (const ix of txInfo.transaction.message.instructions) {
+          console.log('   Program:', ix.programId);
+          console.log('   Data:', ix.data);
+          if (ix.accounts) {
+            console.log('   Accounts:', ix.accounts);
+          }
+          console.log('');
+        }
+      }
+
+      // Print token balances if available
+      if (txInfo.meta?.preTokenBalances || txInfo.meta?.postTokenBalances) {
+        console.log('\nToken Balances:');
+        console.log('Pre:', txInfo.meta.preTokenBalances);
+        console.log('Post:', txInfo.meta.postTokenBalances);
+      }
+
+      console.log('\nTX Error:', txInfo.meta?.err ? txInfo.meta.err : 'None');
+      console.log('------------------------------------\n');
+
       const lbPairPubkey = await this.findLbPairPubkey(txInfo);
       if (!lbPairPubkey) {
-        console.log('Could not find new LB pair address in TX. Skipping...');
+        console.log('[handleNewPool] Could not parse LB pair from TX logs/balances. Skipping...');
         return;
       }
 
-      // Create an instance of DLMM
+      const poolAddrStr = lbPairPubkey.toBase58();
+      if (this.processedPools.has(poolAddrStr)) {
+        console.log(`[handleNewPool] LB pair ${poolAddrStr} already processed. Skipping...`);
+        return;
+      }
+      // Mark as processed to avoid multiple attempts
+      this.processedPools.add(poolAddrStr);
+
+      console.log(`[handleNewPool] Attempting to load DLMM state for new LB Pair: ${poolAddrStr}...`);
       const dlmmPool = await DLMM.create(this.connection, lbPairPubkey, {
         cluster: NETWORK_ENV === 'mainnet' ? 'mainnet-beta' : 'devnet',
       });
 
-      // Check if it has the target token
-      const { tokenX, tokenY, lbPair } = dlmmPool;
-      const hasTargetX = tokenX.publicKey.equals(TARGET_TOKEN_MINT);
-      const hasTargetY = tokenY.publicKey.equals(TARGET_TOKEN_MINT);
-      if (!hasTargetX && !hasTargetY) {
-        console.log(`DLMM pool ${lbPairPubkey.toBase58()} does not contain our target token.`);
-        return;
-      }
-
-      // Check the "other side" is USDC or SOL
-      const otherMint = hasTargetX ? tokenY.publicKey : tokenX.publicKey;
-      const hasUSDC = otherMint.equals(USDC_MINT);
-      const hasSOL  = otherMint.equals(SOL_MINT);
-
-      if (FORCE_SOL && !hasSOL) {
-        console.log('Forcing SOL but pool uses USDC. Skipping...');
-        return;
-      }
-      if (!FORCE_SOL && !hasUSDC && !hasSOL) {
-        console.log('Pool does not contain USDC or SOL. Skipping...');
-        return;
-      }
-
-      // Check liquidity: approximate in SOL eq
-      // For DLMM, you can read dlmmPool.tokenX.amount, dlmmPool.tokenY.amount from the on-chain reserve.
-      // Then approximate
-      let solEq = 0;
-      let amountX = Number(dlmmPool.tokenX.amount.toString()); // raw integer
-      let amountY = Number(dlmmPool.tokenY.amount.toString());
-
-      // Convert based on decimals
-      const humX = amountX / 10 ** dlmmPool.tokenX.decimal;
-      const humY = amountY / 10 ** dlmmPool.tokenY.decimal;
-
-      if (dlmmPool.tokenX.publicKey.equals(SOL_MINT)) {
-        solEq += humX;
-      }
-      if (dlmmPool.tokenY.publicKey.equals(SOL_MINT)) {
-        solEq += humY;
-      }
-      // Rough approximation: 1 USDC ~ 0.5 SOL
-      if (dlmmPool.tokenX.publicKey.equals(USDC_MINT)) {
-        solEq += humX * 0.5;
-      }
-      if (dlmmPool.tokenY.publicKey.equals(USDC_MINT)) {
-        solEq += humY * 0.5;
-      }
-
-      if (solEq < MIN_LIQUIDITY_SOL) {
-        console.log(`Liquidity too low (~${solEq.toFixed(2)} SOL eq). Skipping...`);
-        return;
-      }
-
-      console.log(`\n🏦 New valid DLMM pool: ${lbPairPubkey.toBase58()} => target token + ${hasUSDC ? 'USDC' : 'SOL'}. Attempting snipe...`);
-      const useSOL = FORCE_SOL || (!hasUSDC && hasSOL);
-      await this.snipePool(dlmmPool, useSOL);
+      // Evaluate tokens, liquidity, etc.
+      await this.evaluateAndSnipe(dlmmPool, poolAddrStr);
     } catch (err) {
-      console.error('Error in handleNewPool:', err);
+      console.error('Error in handleNewPool =>', err);
     }
   }
 
   /**
-   * Placeholder: parse logs or postTokenBalances to find the new LB pair address
+   * Evaluate if the new pool meets our snipe conditions (test-mode or normal-mode).
+   * If it does, call doSwapForPool(...) to do the Jito bundle swap.
    */
-  private async findLbPairPubkey(txInfo: HeliusTransaction): Promise<PublicKey | undefined> {
-    // You would parse logs or balances here. We'll just return a dummy address to continue the flow.
-    return new PublicKey('11111111111111111111111111111111');
+  private async evaluateAndSnipe(dlmmPool: any, poolAddrStr: string) {
+    const xMint = dlmmPool.tokenX.publicKey;
+    const yMint = dlmmPool.tokenY.publicKey;
+
+    console.log(`[evaluateAndSnipe] Checking pool => ${poolAddrStr}`);
+    console.log(`   tokenX: ${xMint.toBase58()} [raw: ${dlmmPool.tokenX.amount.toString()}]`);
+    console.log(`   tokenY: ${yMint.toBase58()} [raw: ${dlmmPool.tokenY.amount.toString()}]`);
+
+    // Approx liquidity check in SOL terms
+    const humX = Number(dlmmPool.tokenX.amount.toString()) / (10 ** dlmmPool.tokenX.decimal);
+    const humY = Number(dlmmPool.tokenY.amount.toString()) / (10 ** dlmmPool.tokenY.decimal);
+    let solEq = 0;
+
+    // approximate 1 USDC => 0.5 SOL
+    if (xMint.equals(SOL_MINT))  solEq += humX;
+    if (yMint.equals(SOL_MINT))  solEq += humY;
+    if (xMint.equals(USDC_MINT)) solEq += humX * 0.5;
+    if (yMint.equals(USDC_MINT)) solEq += humY * 0.5;
+
+    console.log(`   approx liquidity in SOL eq => ${solEq.toFixed(4)}`);
+    if (solEq < MIN_LIQUIDITY_SOL) {
+      console.log('   => insufficient liquidity, skipping...');
+      return;
+    }
+
+    // Distinguish test mode from normal mode
+    if (this.isTestMode) {
+      const hasUSDC = xMint.equals(USDC_MINT) || yMint.equals(USDC_MINT);
+      const hasSOL  = xMint.equals(SOL_MINT)  || yMint.equals(SOL_MINT);
+
+      if (!hasUSDC && !hasSOL) {
+        console.log(`   [test-mode] no USDC or SOL => skip`);
+        return;
+      }
+
+      console.log(`   [test-mode] Found a USDC/SOL side => let's snipe the other token`);
+      await this.doSwapForPool(dlmmPool, true);
+
+    } else {
+      // normal mode => must have target token + (USDC or SOL)
+      const hasTargetX = xMint.equals(TARGET_TOKEN_MINT);
+      const hasTargetY = yMint.equals(TARGET_TOKEN_MINT);
+
+      if (!hasTargetX && !hasTargetY) {
+        console.log(`   [normal-mode] does not have target token => skip`);
+        return;
+      }
+
+      // The other side must be USDC or SOL
+      const otherMint = hasTargetX ? yMint : xMint;
+      const isUsdcOrSol = otherMint.equals(USDC_MINT) || otherMint.equals(SOL_MINT);
+      if (!isUsdcOrSol) {
+        console.log(`   [normal-mode] other side is not USDC/SOL => skip`);
+        return;
+      }
+
+      console.log(`   [normal-mode] Has target token + USDC/SOL => attempt snipe now...`);
+      await this.doSwapForPool(dlmmPool, false);
+    }
   }
 
   /**
-   * Execute swap to buy the target token. DLMM has a different code path than mercurial's dynamic-amm.
+   * Actually do the swap.
+   * - If inTestMode => buy the "other token" from whichever side is USDC or SOL.
+   * - If normal => buy the target token from whichever side is not target. 
+   *
+   * Also constructs a 0.01 SOL tip for a random Jito validator, then calls `sendBundle()`.
    */
-  private async snipePool(dlmmPool: any, useSOL: boolean) {
+  private async doSwapForPool(dlmmPool: any, inTestMode: boolean) {
     try {
-      // The "inToken" is either SOL or USDC
-      const inMint = useSOL ? SOL_MINT : USDC_MINT;
-      // The outMint is the target
-      // figure out which side of the DLMM is the target
+      const xMint = dlmmPool.tokenX.publicKey;
+      const yMint = dlmmPool.tokenY.publicKey;
+
+      let inMint: PublicKey;
       let outMint: PublicKey;
-      if (dlmmPool.tokenX.publicKey.equals(TARGET_TOKEN_MINT)) {
-        outMint = dlmmPool.tokenX.publicKey;
+      let lamportsNeeded = 0;
+
+      if (inTestMode) {
+        // If xMint is USDC or SOL => that's paying side
+        // else yMint is paying side
+        const xIsUsdcOrSol = xMint.equals(USDC_MINT) || xMint.equals(SOL_MINT);
+        if (xIsUsdcOrSol) {
+          inMint  = xMint;
+          outMint = yMint;
+        } else {
+          inMint  = yMint;
+          outMint = xMint;
+        }
       } else {
-        outMint = dlmmPool.tokenY.publicKey;
+        // normal mode => find which side is target, the other side is inMint
+        const xIsTarget = xMint.equals(TARGET_TOKEN_MINT);
+        if (xIsTarget) {
+          inMint  = yMint; // must be USDC or SOL
+          outMint = xMint; // target
+        } else {
+          inMint  = xMint; // must be USDC or SOL
+          outMint = yMint; // target
+        }
       }
 
-      const lamports = QUOTE_AMOUNT * LAMPORTS_PER_SOL;
-      // In DLMM, the TS client has a `swapQuote(...)` method,
-      // but we can also do "swap" directly if we want.
-
-      // We must ensure we have ATA for inMint & outMint
-      const user = SNIPER_KEYPAIR.publicKey;
-      // (1) Create ATA for the outMint
-      await getOrCreateAssociatedTokenAccount(
-        this.connection,
-        SNIPER_KEYPAIR,
-        outMint,
-        user
-      );
-
-      // (2) If using SOL, wrap it
-      let inTokenAta: PublicKey;
-      if (useSOL) {
-        // Must create WSOL, deposit SOL, etc.
-        const wsolAta = await getOrCreateAssociatedTokenAccount(
-          this.connection,
-          SNIPER_KEYPAIR,
-          NATIVE_MINT,
-          user
-        );
-        inTokenAta = wsolAta.address;
-        // deposit SOL
-        const wrapTx = await this.buildWrapSolTx(wsolAta.address, lamports);
-        const sig = await this.connection.sendTransaction(wrapTx, [SNIPER_KEYPAIR]);
-        console.log(`Wrap SOL TX => ${sig}, waiting...`);
-        await this.connection.confirmTransaction(sig, 'confirmed');
+      // how many lamports do we need?
+      if (inMint.equals(SOL_MINT)) {
+        lamportsNeeded = Math.floor(QUOTE_AMOUNT_SOL * LAMPORTS_PER_SOL);
+        console.log(`   Paying with SOL => ${QUOTE_AMOUNT_SOL} => lamportsNeeded=${lamportsNeeded}`);
+      } else if (inMint.equals(USDC_MINT)) {
+        lamportsNeeded = Math.floor(QUOTE_AMOUNT_USDC * 1_000_000); 
+        console.log(`   Paying with USDC => ${QUOTE_AMOUNT_USDC} => lamportsNeeded=${lamportsNeeded}`);
       } else {
-        // Just get a USDC ATA
-        const usdcAta = await getOrCreateAssociatedTokenAccount(
-          this.connection,
-          SNIPER_KEYPAIR,
-          inMint,
-          user
-        );
-        inTokenAta = usdcAta.address;
+        console.log(`   inMint is not USDC or SOL => ${inMint.toBase58()} => skip`);
+        return;
       }
 
-      // Next, build a swap quote. We'll do a "swapExactIn" approach
-      // to avoid partial fill complexities. We can do a slippage-based minOut.
-      // The dlmmPool has `swapQuote(...)`.
-      const swapAmount = new BN(lamports);
-      const isSwapYtoX = dlmmPool.tokenY.publicKey.equals(inMint); // if user inMint is Y
-      // We retrieve binArrays for the swap:
+      // Build the swap quote
+      const isSwapYtoX = dlmmPool.tokenY.publicKey.equals(inMint);
       const binArrays = await dlmmPool.getBinArrayForSwap(isSwapYtoX);
-      // Then we do a normal "swapQuote".
-      // "allowedSlippage" in the library is BPS
+      const swapBN = new BN(lamportsNeeded);
+
       const swapQuote = dlmmPool.swapQuote(
-        swapAmount,
+        swapBN,
         isSwapYtoX,
         new BN(SNIPE_SLIPPAGE_BPS),
         binArrays
       );
 
-      console.log(`Swap quote => in: ${swapQuote.consumedInAmount.toString()}, out: ${swapQuote.outAmount.toString()}`);
-      console.log(`Price impact => ${swapQuote.priceImpact.toFixed(3)} %`);
-      // Then we build the actual swap transaction
+      console.log(`   swapQuote => in:${swapQuote.consumedInAmount.toString()}, out:${swapQuote.outAmount.toString()}, priceImp:${swapQuote.priceImpact.toString()}%`);
+
+      // If paying with SOL => wrap it
+      let wsolAta: PublicKey | undefined;
+      if (inMint.equals(SOL_MINT)) {
+        const wsolAcct = await getOrCreateMeteoraAta(
+          this.connection,
+          SNIPER_KEYPAIR,
+          SOL_MINT,
+          SNIPER_KEYPAIR.publicKey
+        );
+        wsolAta = wsolAcct.address;
+      }
+
+      // create ATA for outMint if needed
+      await getOrCreateMeteoraAta(
+        this.connection,
+        SNIPER_KEYPAIR,
+        outMint,
+        SNIPER_KEYPAIR.publicKey
+      );
+
+      // build the swap instructions
       const swapTx = await dlmmPool.swap({
-        inToken: dlmmPool.tokenX.publicKey.equals(inMint)
-          ? dlmmPool.tokenX.publicKey
-          : dlmmPool.tokenY.publicKey,
+        inToken: inMint,
         outToken: outMint,
         inAmount: swapQuote.consumedInAmount,
         minOutAmount: swapQuote.minOutAmount,
         lbPair: dlmmPool.pubkey,
-        user,
+        user: SNIPER_KEYPAIR.publicKey,
         binArraysPubkey: swapQuote.binArraysPubkey,
+        ...(inMint.equals(SOL_MINT)
+          ? (isSwapYtoX ? { userTokenY: wsolAta } : { userTokenX: wsolAta })
+          : {}
+        ),
       });
-      // sign & send
-      const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
-      swapTx.feePayer = user;
-      swapTx.recentBlockhash = latestBlockhash.blockhash;
-      swapTx.sign(SNIPER_KEYPAIR);
-      const txSig = await this.connection.sendRawTransaction(swapTx.serialize(), {
-        skipPreflight: false,
-        maxRetries: 3,
-      });
-      console.log(`Swap sent => ${txSig}`);
 
-      const confirmRes = await this.connection.confirmTransaction({
-        signature: txSig,
-        blockhash: latestBlockhash.blockhash,
-        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-      }, 'confirmed');
-      if (confirmRes.value.err) {
-        console.error(`Swap error => `, confirmRes.value.err);
-      } else {
-        console.log(`✅ Snipe success => swapped for target token (DLMM)`);
+      const instructions: TransactionInstruction[] = [...swapTx.instructions];
+
+      // If paying with SOL, we must deposit lamports to the WSOL ATA first
+      if (inMint.equals(SOL_MINT) && wsolAta) {
+        const wrapIxs = await createWrapSolInstructions(
+          this.connection,
+          SNIPER_KEYPAIR.publicKey,
+          wsolAta,
+          lamportsNeeded
+        );
+        instructions.unshift(...wrapIxs);
       }
+
+      // Build versioned transaction for the swap
+      const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+      const swapMessage = new TransactionMessage({
+        payerKey: SNIPER_KEYPAIR.publicKey,
+        recentBlockhash: latestBlockhash.blockhash,
+        instructions,
+      }).compileToV0Message();
+      const swapVtx = new VersionedTransaction(swapMessage);
+      swapVtx.sign([SNIPER_KEYPAIR]);
+
+      // Build tip transaction => 0.01 SOL to a random Jito validator
+      const tipValidator = pickRandomJitoValidator();
+      console.log(`   Tipping validator: ${tipValidator.toBase58()} => 0.01 SOL`);
+      const tipIx = SystemProgram.transfer({
+        fromPubkey: SNIPER_KEYPAIR.publicKey,
+        toPubkey: tipValidator,
+        lamports: TIP_LAMPORTS,
+      });
+
+      const tipMessage = new TransactionMessage({
+        payerKey: SNIPER_KEYPAIR.publicKey,
+        recentBlockhash: latestBlockhash.blockhash,
+        instructions: [tipIx],
+      }).compileToV0Message();
+
+      const tipVtx = new VersionedTransaction(tipMessage);
+      tipVtx.sign([SNIPER_KEYPAIR]);
+
+      // Send them together via Jito
+      console.log('   => sending Jito bundle with tip + swap...');
+      await sendBundle(
+        SNIPER_KEYPAIR,
+        this.connection,
+        async (_blk: BlockhashWithExpiryBlockHeight, _tipAccount: PublicKey) => {
+          return [tipVtx, swapVtx];
+        },
+        5,
+        30000
+      );
+
+      console.log('   => Jito bundle sent. Await acceptance/rejection events.\n');
+
     } catch (err) {
-      console.error('❌ snipePool error:', err);
+      console.error('[doSwapForPool] Error =>', err);
     }
   }
 
   /**
-   * Build a simple transaction that wraps SOL into an existing WSOL ATA
+   * (Placeholder) parse logs or postTokenBalances from txInfo to find the newly-created LB Pair address.
+   * You must implement a real parser for production usage.
    */
-  private async buildWrapSolTx(wsolAta: PublicKey, lamports: number) {
-    const tx = new Transaction();
-    tx.add(
-      SystemProgram.transfer({
-        fromPubkey: SNIPER_KEYPAIR.publicKey,
-        toPubkey: wsolAta,
-        lamports,
-      }),
-      createSyncNativeInstruction(wsolAta)
-    );
-    tx.feePayer = SNIPER_KEYPAIR.publicKey;
-    tx.recentBlockhash = (await this.connection.getLatestBlockhash('confirmed')).blockhash;
-    return tx;
+  private async findLbPairPubkey(_txInfo: HeliusTransaction): Promise<PublicKey | null> {
+    // TODO: implement real logic
+    // For demonstration, returning null => no actual snipe occurs
+    return null;
   }
 }
 
-// Command line argument parser
-function parseCliArgs() {
-  const args = process.argv.slice(2);
-  return {
-    isTestMode: args.includes('--test'),
-    help: args.includes('--help') || args.includes('-h'),
-  };
-}
-
-// Display help message
-function displayHelp() {
-  console.log(`
-DLMM Sniper - Usage:
-  npx ts-node src/meteora/super-sniper-dynamicamm.ts [options]
-
-Options:
-  --test     Run in test mode to verify configuration and functionality
-  --help,-h  Display this help message
-
-Examples:
-  npx ts-node src/meteora/super-sniper-dynamicamm.ts             Start the sniper in live mode
-  npx ts-node src/meteora/super-sniper-dynamicamm.ts --test      Run in test mode
-  `);
-}
-
-// If run directly
+// If invoked directly
 if (require.main === module) {
-  const { isTestMode, help } = parseCliArgs();
-
-  if (help) {
-    displayHelp();
-    process.exit(0);
-  }
-
-  if (isTestMode) {
-    console.log('\n🧪 Running in test mode...');
-    testDlmmSniper();
-  } else {
-    const sniper = new DlmmPoolSniper(RPC_ENDPOINT, WS_MAINNET_ENDPOINT);
-    sniper.start();
-    console.log('Press Ctrl+C to exit...');
-  }
-}
-
-/**
- * Test mode function to verify the DLMM sniper functionality
- */
-async function testDlmmSniper() {
-  const TEST_AMOUNT = 5;
-  console.log('Testing DLMM Sniper functionality...');
-  console.log('Sniper wallet:', SNIPER_KEYPAIR.publicKey.toString());
-  console.log(`Target token: ${TARGET_TOKEN_ADDRESS}`);
-  console.log(`Using ${FORCE_SOL ? 'SOL' : 'USDC'} for purchases`);
-  console.log(`Test amount: ${TEST_AMOUNT} ${FORCE_SOL ? 'SOL' : 'USDC'}`);
-  console.log(`Slippage: ${SNIPE_SLIPPAGE_BPS} BPS`);
-  console.log(`Min liquidity: ${MIN_LIQUIDITY_SOL} SOL\n`);
-
-  try {
-    const connection = new Connection(RPC_ENDPOINT, 'confirmed');
-    console.log('Testing RPC connection...');
-    const bh = await connection.getBlockHeight();
-    console.log('✅ RPC block height:', bh);
-
-    // Pick an existing DLMM pool address for test
-    const testPool = process.env.TEST_POOL_ADDRESS || (
-      FORCE_SOL
-        ? '11111111111111111111111111111111' // placeholder SOL pool
-        : '22222222222222222222222222222222' // placeholder USDC pool
-    );
-    console.log('\n🏦 Testing with LB Pair:', testPool);
-
-    // Create the DLMM instance
-    const dlmmPool = await DLMM.create(connection, new PublicKey(testPool), {
-      cluster: NETWORK_ENV === 'mainnet' ? 'mainnet-beta' : 'devnet',
-    });
-    console.log('✅ Successfully loaded DLMM pool');
-
-    // Display some pool info
-    console.log('LB Pair address:', dlmmPool.pubkey.toBase58());
-    console.log('Token X Mint:', dlmmPool.tokenX.publicKey.toBase58(), 'dec:', dlmmPool.tokenX.decimal);
-    console.log('Token Y Mint:', dlmmPool.tokenY.publicKey.toBase58(), 'dec:', dlmmPool.tokenY.decimal);
-
-    // Suppose we do a small test swap
-    const inAmountLamports = new BN(TEST_AMOUNT * LAMPORTS_PER_SOL);
-    const isSwapYtoX = dlmmPool.tokenY.publicKey.equals(FORCE_SOL ? SOL_MINT : USDC_MINT);
-
-    // get bin arrays
-    const binArrays = await dlmmPool.getBinArrayForSwap(isSwapYtoX);
-    // get quote
-    const swapQuote = dlmmPool.swapQuote(inAmountLamports, isSwapYtoX, new BN(SNIPE_SLIPPAGE_BPS), binArrays);
-    console.log('Swap quote =>', {
-      consumedInAmount: swapQuote.consumedInAmount.toString(),
-      outAmount: swapQuote.outAmount.toString(),
-      minOutAmount: swapQuote.minOutAmount.toString(),
-      priceImpact: swapQuote.priceImpact.toNumber(),
-    });
-
-    // Build the tx
-    const inMint = isSwapYtoX ? dlmmPool.tokenY.publicKey : dlmmPool.tokenX.publicKey;
-    const outMint = isSwapYtoX ? dlmmPool.tokenX.publicKey : dlmmPool.tokenY.publicKey;
-    const swapTx = await dlmmPool.swap({
-      inToken: inMint,
-      outToken: outMint,
-      inAmount: swapQuote.consumedInAmount,
-      minOutAmount: swapQuote.minOutAmount,
-      lbPair: dlmmPool.pubkey,
-      user: SNIPER_KEYPAIR.publicKey,
-      binArraysPubkey: swapQuote.binArraysPubkey,
-    });
-    swapTx.feePayer = SNIPER_KEYPAIR.publicKey;
-    const latestBlockhash = await connection.getLatestBlockhash('confirmed');
-    swapTx.recentBlockhash = latestBlockhash.blockhash;
-    swapTx.sign(SNIPER_KEYPAIR);
-
-    const txSig = await connection.sendRawTransaction(swapTx.serialize(), {
-      skipPreflight: false,
-      maxRetries: 3,
-    });
-    console.log('Test swap TX =>', txSig);
-    console.log(`Explorer link => https://solscan.io/tx/${txSig}`);
-
-    // We won't wait for confirmation in the example
-    console.log('✅ Test completed (transaction submitted).');
-  } catch (err) {
-    console.error('\n❌ Test failed:', err);
-    process.exit(1);
-  }
+  const { isTestMode } = parseCliArgs();
+  const sniper = new O1DlmmSniper(RPC_ENDPOINT, WS_ENDPOINT, isTestMode);
+  sniper.start();
+  console.log('Press Ctrl+C to exit...');
 }
