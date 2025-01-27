@@ -1,188 +1,192 @@
-import WebSocket from 'ws';
-import { ENVIRONMENTS } from './config';
-import { AppState } from './index';
-import { filter } from './sniper';
-import { MeteoraSniper } from './sniper';
-import { logger } from './logger';
-import { PublicKey } from '@solana/web3.js';
+// /*
+//  * DEPRECATED: This file is no longer used. See src/grpc.ts for the current implementation.
+//  */
 
-export interface HeliusTransactionNotifyMessage {
-  jsonrpc: string;
-  method: string;
-  error?: {
-    code: number;
-    message: string;
-  };
-  params: {
-    subscription: number;
-    result: {
-      signature: string;
-      transaction: {
-        message: any;
-        meta: any;
-      };
-    };
-  };
-}
+// import WebSocket from 'ws';
+// import { ENVIRONMENTS } from './config';
+// import { AppState } from './index';
+// import { filter } from './sniper';
+// import { MeteoraSniper } from './sniper';
+// import { logger } from './logger';
+// import { PublicKey } from '@solana/web3.js';
 
-export class HeliusWebSocketClient {
-  public state: AppState;
-  public wsUrl: string;
+// export interface HeliusTransactionNotifyMessage {
+//   jsonrpc: string;
+//   method: string;
+//   error?: {
+//     code: number;
+//     message: string;
+//   };
+//   params: {
+//     subscription: number;
+//     result: {
+//       signature: string;
+//       transaction: {
+//         message: any;
+//         meta: any;
+//       };
+//     };
+//   };
+// }
 
-  constructor(state: AppState) {
-    this.state = state;
-    this.wsUrl = `wss://atlas-mainnet.helius-rpc.com/?api-key=${ENVIRONMENTS.grpc_token}`;
-  }
+// export class HeliusWebSocketClient {
+//   public state: AppState;
+//   public wsUrl: string;
 
-  public async start_listener(): Promise<void> {
-    logger.info(`[HeliusWebSocketClient] Attempting connection => ${this.wsUrl}`);
-    await this.connectAndSubscribe();
-  }
+//   constructor(state: AppState) {
+//     this.state = state;
+//     this.wsUrl = `wss://atlas-mainnet.helius-rpc.com/?api-key=${ENVIRONMENTS.grpc_token}`;
+//   }
 
-  private async connectAndSubscribe(): Promise<void> {
-    const ws = new WebSocket(this.wsUrl);
+//   public async start_listener(): Promise<void> {
+//     logger.info(`[HeliusWebSocketClient] Attempting connection => ${this.wsUrl}`);
+//     await this.connectAndSubscribe();
+//   }
 
-    ws.on('open', () => {
-      logger.info(`✅ [HeliusWebSocketClient] WebSocket connected. Subscribing to transactions...`);
+//   private async connectAndSubscribe(): Promise<void> {
+//     const ws = new WebSocket(this.wsUrl);
 
-      // watch for LB program ID
-      const subscription = {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'transactionSubscribe',
-        params: [
-          {
-            accountInclude: [MeteoraSniper.program_id().toBase58()],
-            failed: false,
-          },
-          {
-            commitment: 'confirmed',
-            maxSupportedTransactionVersion: 0,
-            transactionDetails: 'full',
-          },
-        ],
-      };
+//     ws.on('open', () => {
+//       logger.info(`✅ [HeliusWebSocketClient] WebSocket connected. Subscribing to transactions...`);
 
-      try {
-        ws.send(JSON.stringify(subscription));
-        logger.info(`[HeliusWebSocketClient] Subscription request sent.  Waiting for messages...`);
-      } catch (err) {
-        logger.error(`[HeliusWebSocketClient] Failed to send sub request => ${(err as Error).message}`);
-      }
-    });
+//       // watch for LB program ID
+//       const subscription = {
+//         jsonrpc: '2.0',
+//         id: 1,
+//         method: 'transactionSubscribe',
+//         params: [
+//           {
+//             accountInclude: [MeteoraSniper.program_id().toBase58()],
+//             failed: false,
+//           },
+//           {
+//             commitment: 'confirmed',
+//             maxSupportedTransactionVersion: 0,
+//             transactionDetails: 'full',
+//           },
+//         ],
+//       };
 
-    ws.on('message', async (rawData: Buffer) => {
-      logger.debug(`[HeliusWebSocketClient] Received raw message => ${rawData.toString().slice(0,300)}...`);
-      try {
-        const dataStr = rawData.toString();
-        const msg: HeliusTransactionNotifyMessage = JSON.parse(dataStr);
+//       try {
+//         ws.send(JSON.stringify(subscription));
+//         logger.info(`[HeliusWebSocketClient] Subscription request sent.  Waiting for messages...`);
+//       } catch (err) {
+//         logger.error(`[HeliusWebSocketClient] Failed to send sub request => ${(err as Error).message}`);
+//       }
+//     });
 
-        if (msg.error) {
-          logger.error(`[HeliusWebSocketClient] Subscription error => code=${msg.error.code}, msg=${msg.error.message}`);
-          return;
-        }
-        if (!msg.params?.result?.transaction) {
-          logger.debug(`[HeliusWebSocketClient] No transaction data => ${JSON.stringify(msg)}`);
-          return;
-        }
+//     ws.on('message', async (rawData: Buffer) => {
+//       logger.debug(`[HeliusWebSocketClient] Received raw message => ${rawData.toString().slice(0,300)}...`);
+//       try {
+//         const dataStr = rawData.toString();
+//         const msg: HeliusTransactionNotifyMessage = JSON.parse(dataStr);
 
-        const { signature, transaction } = msg.params.result;
-        logger.info(`[HeliusWebSocketClient] => Tx signature: ${signature}`);
+//         if (msg.error) {
+//           logger.error(`[HeliusWebSocketClient] Subscription error => code=${msg.error.code}, msg=${msg.error.message}`);
+//           return;
+//         }
+//         if (!msg.params?.result?.transaction) {
+//           logger.debug(`[HeliusWebSocketClient] No transaction data => ${JSON.stringify(msg)}`);
+//           return;
+//         }
 
-        // Check for pool initialization in logs
-        const logMessages = transaction.meta?.logMessages || [];
-        const hasInitPool = logMessages.some((log: string) => 
-          log.toLowerCase().includes('instruction: initializelbpair') ||
-          log.toLowerCase().includes('instruction: initialize_lb_pair')
-        );
+//         const { signature, transaction } = msg.params.result;
+//         logger.info(`[HeliusWebSocketClient] => Tx signature: ${signature}`);
 
-        if (hasInitPool) {
-          logger.info(`[HeliusWebSocketClient] Found pool creation => signature=${signature}`);
+//         // Check for pool initialization in logs
+//         const logMessages = transaction.meta?.logMessages || [];
+//         const hasInitPool = logMessages.some((log: string) => 
+//           log.toLowerCase().includes('instruction: initializelbpair') ||
+//           log.toLowerCase().includes('instruction: initialize_lb_pair')
+//         );
+
+//         if (hasInitPool) {
+//           logger.info(`[HeliusWebSocketClient] Found pool creation => signature=${signature}`);
           
-          // Extract pool details from token balances
-          if (transaction.meta.postTokenBalances && transaction.meta.postTokenBalances.length >= 2) {
-            const [firstBalance, secondBalance] = transaction.meta.postTokenBalances;
-            const poolAddress = firstBalance.owner;
-            const tokenX = firstBalance.mint;
-            const tokenY = secondBalance.mint;
+//           // Extract pool details from token balances
+//           if (transaction.meta.postTokenBalances && transaction.meta.postTokenBalances.length >= 2) {
+//             const [firstBalance, secondBalance] = transaction.meta.postTokenBalances;
+//             const poolAddress = firstBalance.owner;
+//             const tokenX = firstBalance.mint;
+//             const tokenY = secondBalance.mint;
 
-            logger.info(`[HeliusWebSocketClient] Pool Details:\nPool Address: ${poolAddress}\nTokenX: ${tokenX}\nTokenY: ${tokenY}`);
+//             logger.info(`[HeliusWebSocketClient] Pool Details:\nPool Address: ${poolAddress}\nTokenX: ${tokenX}\nTokenY: ${tokenY}`);
 
-            try {
-              const meteoraSniper = new MeteoraSniper({
-                lb_pair: new PublicKey(poolAddress),
-                token_mint_x: new PublicKey(tokenX),
-                token_mint_y: new PublicKey(tokenY),
-                bin_array_bitmap_extension: new PublicKey(0), // These fields aren't needed for sniping
-                reserve_x: new PublicKey(0),
-                reserve_y: new PublicKey(0),
-                oracle: new PublicKey(0),
-                preset_parameter: new PublicKey(0),
-                funder: new PublicKey(0),
-                token_program: new PublicKey(0),
-                system_program: new PublicKey(0),
-                rent: new PublicKey(0),
-                event_authority: new PublicKey(0),
-                program: new PublicKey(0)
-              });
+//             try {
+//               const meteoraSniper = new MeteoraSniper({
+//                 lb_pair: new PublicKey(poolAddress),
+//                 token_mint_x: new PublicKey(tokenX),
+//                 token_mint_y: new PublicKey(tokenY),
+//                 bin_array_bitmap_extension: new PublicKey(0), // These fields aren't needed for sniping
+//                 reserve_x: new PublicKey(0),
+//                 reserve_y: new PublicKey(0),
+//                 oracle: new PublicKey(0),
+//                 preset_parameter: new PublicKey(0),
+//                 funder: new PublicKey(0),
+//                 token_program: new PublicKey(0),
+//                 system_program: new PublicKey(0),
+//                 rent: new PublicKey(0),
+//                 event_authority: new PublicKey(0),
+//                 program: new PublicKey(0)
+//               });
 
-              await meteoraSniper.notify(this.state);
-              logger.info(`[HeliusWebSocketClient] Successfully notified state of new pool`);
-            } catch (err) {
-              logger.error(`[HeliusWebSocketClient] Failed to create MeteoraSniper => ${(err as Error).message}`);
-            }
-          }
-        }
-      } catch (err) {
-        logger.error(`[HeliusWebSocketClient] Error processing message => ${(err as Error).message}`);
-      }
-    });
+//               await meteoraSniper.notify(this.state);
+//               logger.info(`[HeliusWebSocketClient] Successfully notified state of new pool`);
+//             } catch (err) {
+//               logger.error(`[HeliusWebSocketClient] Failed to create MeteoraSniper => ${(err as Error).message}`);
+//             }
+//           }
+//         }
+//       } catch (err) {
+//         logger.error(`[HeliusWebSocketClient] Error processing message => ${(err as Error).message}`);
+//       }
+//     });
 
-    ws.on('close', () => {
-      logger.warn(`[HeliusWebSocketClient] WebSocket closed. Reconnecting in 5s...`);
-      setTimeout(() => this.connectAndSubscribe(), 5000);
-    });
+//     ws.on('close', () => {
+//       logger.warn(`[HeliusWebSocketClient] WebSocket closed. Reconnecting in 5s...`);
+//       setTimeout(() => this.connectAndSubscribe(), 5000);
+//     });
 
-    ws.on('error', (err) => {
-      logger.error(`[HeliusWebSocketClient] WebSocket error => ${(err as Error).message}`);
-      ws.close();
-    });
-  }
+//     ws.on('error', (err) => {
+//       logger.error(`[HeliusWebSocketClient] WebSocket error => ${(err as Error).message}`);
+//       ws.close();
+//     });
+//   }
 
-  private decompileHeliusInstructions(heliusTx: any): any[] {
-    logger.debug(`[HeliusWebSocketClient] Decompiling Helius instructions from the TX...`);
+//   private decompileHeliusInstructions(heliusTx: any): any[] {
+//     logger.debug(`[HeliusWebSocketClient] Decompiling Helius instructions from the TX...`);
 
-    const mainIx = heliusTx?.message?.instructions || [];
-    const innerIx = heliusTx?.meta?.innerInstructions || [];
+//     const mainIx = heliusTx?.message?.instructions || [];
+//     const innerIx = heliusTx?.meta?.innerInstructions || [];
 
-    // Flatten them
-    const all: any[] = mainIx.map((ix: any, ixIndex: number) => {
-      const progIdIdx = ix.programIdIndex;
-      const programId = heliusTx.message.accountKeys[progIdIdx] || '';
-      return {
-        programId,
-        data: ix.data ? Buffer.from(ix.data, 'base64') : Buffer.alloc(0),
-        accounts: ix.accounts.map((accIdx: number) => ({
-          pubkey: heliusTx.message.accountKeys[accIdx],
-        })),
-      };
-    });
+//     // Flatten them
+//     const all: any[] = mainIx.map((ix: any, ixIndex: number) => {
+//       const progIdIdx = ix.programIdIndex;
+//       const programId = heliusTx.message.accountKeys[progIdIdx] || '';
+//       return {
+//         programId,
+//         data: ix.data ? Buffer.from(ix.data, 'base64') : Buffer.alloc(0),
+//         accounts: ix.accounts.map((accIdx: number) => ({
+//           pubkey: heliusTx.message.accountKeys[accIdx],
+//         })),
+//       };
+//     });
 
-    innerIx.forEach((innerObj: any, iIndex: number) => {
-      innerObj.instructions.forEach((i: any, subIndex: number) => {
-        const progIdIdx = i.programIdIndex;
-        const programId = heliusTx.message.accountKeys[progIdIdx] || '';
-        all.push({
-          programId,
-          data: i.data ? Buffer.from(i.data, 'base64') : Buffer.alloc(0),
-          accounts: i.accounts.map((accIdx: number) => ({
-            pubkey: heliusTx.message.accountKeys[accIdx],
-          })),
-        });
-      });
-    });
+//     innerIx.forEach((innerObj: any, iIndex: number) => {
+//       innerObj.instructions.forEach((i: any, subIndex: number) => {
+//         const progIdIdx = i.programIdIndex;
+//         const programId = heliusTx.message.accountKeys[progIdIdx] || '';
+//         all.push({
+//           programId,
+//           data: i.data ? Buffer.from(i.data, 'base64') : Buffer.alloc(0),
+//           accounts: i.accounts.map((accIdx: number) => ({
+//             pubkey: heliusTx.message.accountKeys[accIdx],
+//           })),
+//         });
+//       });
+//     });
 
-    logger.debug(`[HeliusWebSocketClient] => total instructions: ${all.length}`);
-    return all;
-  }
-}
+//     logger.debug(`[HeliusWebSocketClient] => total instructions: ${all.length}`);
+//     return all;
+//   }
+// }
