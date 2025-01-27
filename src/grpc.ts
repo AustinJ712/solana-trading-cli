@@ -149,83 +149,90 @@ export class HeliusWebSocketClient {
           line.toLowerCase().includes('instruction: initialize_lb_pair')
         );
 
-        if (!hasInitPool) {
-          // Not a pool creation => skip
-          return;
-        }
+        if (hasInitPool) {
+          // We do big ASCII art + "FOUND A NEW POOL" so it shows in console even after 100 lines
+          logger.info(`  
+        
+🎉 🎉  FOUND A NEW POOL  🎉 🎉
+Tx Signature: ${signature}
+View on Solscan: https://solscan.io/tx/${signature}
 
-        logger.info(`[HeliusWebSocketClient] Found pool creation => signature=${signature}`);
+(This line always prints in console because it has "FOUND A NEW POOL")
+          `);
 
-        // 3) Attempt to find LB pair address in the compiled instructions
-        //    We look for an instruction whose first 8 data bytes = sighash("initializeLbPair"),
-        //    then the first account of that instruction is the LB pair address
-        let lbPairAddress: string | null = null;
+          // 3) Attempt to find LB pair address in the compiled instructions
+          //    We look for an instruction whose first 8 data bytes = sighash("initializeLbPair"),
+          //    then the first account of that instruction is the LB pair address
+          let lbPairAddress: string | null = null;
 
-        const compiledIx = decodedTx.message.compiledInstructions || [];
-        const accountKeys = decodedTx.message.staticAccountKeys || [];
+          const compiledIx = decodedTx.message.compiledInstructions || [];
+          const accountKeys = decodedTx.message.staticAccountKeys || [];
 
-        // We'll see if any compiled instruction belongs to the LB program
-        // and starts with the correct 8-byte discriminator
-        for (const ix of compiledIx) {
-          const programId = accountKeys[ix.programIdIndex];
-          if (programId.equals(MeteoraSniper.program_id())) {
-            const dataBuf = ix.data;
-            const disc = dataBuf.subarray(0, 8);
-            const expectedDisc = Buffer.from(MeteoraSniper.discriminator());
-            if (Buffer.compare(disc, expectedDisc) === 0) {
-              // The LB pair is typically the first account index for this instruction
-              const lbPairKeyIndex = ix.accountKeyIndexes[0];
-              lbPairAddress = accountKeys[lbPairKeyIndex].toBase58();
-              break;
+          // We'll see if any compiled instruction belongs to the LB program
+          // and starts with the correct 8-byte discriminator
+          for (const ix of compiledIx) {
+            const programId = accountKeys[ix.programIdIndex];
+            if (programId.equals(MeteoraSniper.program_id())) {
+              const dataBuf = ix.data;
+              const disc = dataBuf.subarray(0, 8);
+              const expectedDisc = Buffer.from(MeteoraSniper.discriminator());
+              if (Buffer.compare(disc, expectedDisc) === 0) {
+                // The LB pair is typically the first account index for this instruction
+                const lbPairKeyIndex = ix.accountKeyIndexes[0];
+                lbPairAddress = accountKeys[lbPairKeyIndex].toBase58();
+                break;
+              }
             }
           }
-        }
 
-        // 4) If we STILL haven't found the LB pair, try the "innerInstructions" from Helius meta
-        if (!lbPairAddress) {
-          lbPairAddress = this.arrangeLbPairFromInnerCreate(decodedTx, txInfo.meta);
-          if (lbPairAddress) {
-            logger.debug(`[HeliusWebSocketClient] Recovered LB pair address from 'createAccount' in inner ixs => ${lbPairAddress}`);
+          // 4) If we STILL haven't found the LB pair, try the "innerInstructions" from Helius meta
+          if (!lbPairAddress) {
+            lbPairAddress = this.arrangeLbPairFromInnerCreate(decodedTx, txInfo.meta);
+            if (lbPairAddress) {
+              logger.debug(`[HeliusWebSocketClient] Recovered LB pair address from 'createAccount' in inner ixs => ${lbPairAddress}`);
+            }
           }
-        }
 
-        if (!lbPairAddress) {
-          logger.error('[HeliusWebSocketClient] Could not find LB pair address in main or inner instructions');
-          return;
-        }
+          if (!lbPairAddress) {
+            logger.error('[HeliusWebSocketClient] Could not find LB pair address in main or inner instructions');
+            return;
+          }
 
-        // 5) Gather the two token mints from postTokenBalances
-        const postTokenBalances = txInfo.meta?.postTokenBalances;
-        if (postTokenBalances && postTokenBalances.length >= 2) {
-          const [firstBalance, secondBalance] = postTokenBalances;
-          const tokenX = firstBalance.mint;
-          const tokenY = secondBalance.mint;
+          // 5) Gather the two token mints from postTokenBalances
+          const postTokenBalances = txInfo.meta?.postTokenBalances;
+          if (postTokenBalances && postTokenBalances.length >= 2) {
+            const [firstBalance, secondBalance] = postTokenBalances;
+            const tokenX = firstBalance.mint;
+            const tokenY = secondBalance.mint;
 
-          logger.info(`[HeliusWebSocketClient] Pool Details:\nPool Address: ${lbPairAddress}\nTokenX: ${tokenX}\nTokenY: ${tokenY}`);
+            logger.info(`[HeliusWebSocketClient] Pool Details:\nPool Address: ${lbPairAddress}\nTokenX: ${tokenX}\nTokenY: ${tokenY}`);
 
-          // 6) Construct a minimal sniper with that data
-          try {
-            const sniper = new MeteoraSniper({
-              lb_pair: new PublicKey(lbPairAddress),
-              bin_array_bitmap_extension: PublicKey.default,
-              token_mint_x: new PublicKey(tokenX),
-              token_mint_y: new PublicKey(tokenY),
-              reserve_x: PublicKey.default,
-              reserve_y: PublicKey.default,
-              oracle: PublicKey.default,
-              preset_parameter: PublicKey.default,
-              funder: PublicKey.default,
-              token_program: PublicKey.default,
-              system_program: PublicKey.default,
-              rent: PublicKey.default,
-              event_authority: PublicKey.default,
-              program: MeteoraSniper.program_id(),
-            });
+            // 6) Construct a minimal sniper with that data
+            try {
+              const sniper = new MeteoraSniper({
+                lb_pair: new PublicKey(lbPairAddress),
+                bin_array_bitmap_extension: PublicKey.default,
+                token_mint_x: new PublicKey(tokenX),
+                token_mint_y: new PublicKey(tokenY),
+                reserve_x: PublicKey.default,
+                reserve_y: PublicKey.default,
+                oracle: PublicKey.default,
+                preset_parameter: PublicKey.default,
+                funder: PublicKey.default,
+                token_program: PublicKey.default,
+                system_program: PublicKey.default,
+                rent: PublicKey.default,
+                event_authority: PublicKey.default,
+                program: MeteoraSniper.program_id(),
+              });
 
-            await sniper.notify(this.state);
-            logger.info(`[HeliusWebSocketClient] Notified sniper of new pool => lb_pair=${lbPairAddress}`);
-          } catch (err) {
-            logger.error(`[HeliusWebSocketClient] Failed to create MeteoraSniper => ${(err as Error).message}`);
+              await sniper.notify(this.state);
+              logger.info(`[HeliusWebSocketClient] Notified sniper of new pool => lb_pair=${lbPairAddress}`);
+            } catch (err) {
+              logger.error(`[HeliusWebSocketClient] Failed to create MeteoraSniper => ${(err as Error).message}`);
+            }
+          } else {
+            logger.warn(`[HeliusWebSocketClient] Found "initializeLbPair" logs but no postTokenBalances => skipping snipe`);
           }
         } else {
           logger.warn(`[HeliusWebSocketClient] Found "initializeLbPair" logs but no postTokenBalances => skipping snipe`);

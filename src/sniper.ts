@@ -357,7 +357,17 @@ async function execute_swaps(
               ephemeralKp,
               isUsdc
             );
-            logger.info(`[execute_swaps] Swap success => signature=${signature}`);
+
+            // ASCII / emoji log with "SWAP SUCCESS" so console prints it after 100 lines
+            logger.info(`
+SNIPED
+
+🔥 SWAP SUCCESS for wallet: ${s.wallet}
+Tx: https://solscan.io/tx/${signature}
+
+(This line always prints in console because it has "SWAP SUCCESS")
+            `);
+
             // mark as done
             await SnipeConfig.update_data(
               s.wallet,
