@@ -7,8 +7,8 @@
  */
 
 import { config as dotenvConfig } from 'dotenv';
-import { Connection, Keypair, clusterApiUrl } from '@solana/web3.js';
-import bs58 from 'bs58';
+import { Connection, clusterApiUrl } from '@solana/web3.js';
+
 // Load env variables from .env
 dotenvConfig();
 
@@ -51,13 +51,6 @@ export class Environments {
 
 // In Rust we had "lazy_static!", in TS we can just do a singleton approach:
 export const ENVIRONMENTS = new Environments();
-
-export const jito_fee = process.env.JITO_FEE; // 0.00009 SOL
-export const shyft_api_key = process.env.SHYFT_API_KEY; // your shyft api key
-export const wallet = Keypair.fromSecretKey(
-  bs58.decode(process.env.PRIVATE_KEY || "")
-);
-export const connection = new Connection(ENVIRONMENTS.rpc_connection, "confirmed");
 
 /**
  * In the Rust code, we also had a global RPC_CONNECTION. We replicate that here:
