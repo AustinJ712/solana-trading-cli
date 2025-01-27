@@ -20,7 +20,7 @@ import { DateTime } from 'luxon';
 export interface SnipeConfigModel {
   wallet: string;         // The wallet address that will execute the snipe
   priv_key: string;       // Private key of the wallet (stored as base58 string)
-  snipe_amount: number;   // Legacy field - to be deprecated
+  snipe_amount_deprecated: number;   // Legacy field - no longer used
   snipe_amount_sol: number | null;  // Amount of SOL to spend (in SOL)
   snipe_amount_usdc: number | null; // Amount of USDC to spend (in USDC)
   token: string;          // Address of the token to snipe
@@ -93,7 +93,7 @@ export class SnipeConfig {
     const config: SnipeConfigModel = {
       wallet: kp.publicKey.toBase58(),
       priv_key: Buffer.from(kp.secretKey).toString('base64'),
-      snipe_amount: Math.floor(request.amount_sol * LAMPORTS_PER_SOL), // Legacy field
+      snipe_amount_deprecated: Math.floor(request.amount_sol * LAMPORTS_PER_SOL), // Legacy field
       snipe_amount_sol: request.amount_sol,
       snipe_amount_usdc: request.amount_usdc,
       token: request.token,
@@ -107,13 +107,13 @@ export class SnipeConfig {
     // Insert into DB with new columns
     await pool.query(
       `INSERT INTO snipe_config(
-        wallet, priv_key, snipe_amount, snipe_amount_sol, snipe_amount_usdc, 
+        wallet, priv_key, snipe_amount_deprecated, snipe_amount_sol, snipe_amount_usdc, 
         token, main_wallet, status, tx_hash, executed_at, jito_tip
       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [
         config.wallet,
         config.priv_key,
-        config.snipe_amount,
+        config.snipe_amount_deprecated,
         config.snipe_amount_sol,
         config.snipe_amount_usdc,
         config.token,
