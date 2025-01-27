@@ -349,7 +349,27 @@ async function execute_swaps(
               logger.error(`[execute_swaps] Account not found => ${data.accounts.lb_pair.toBase58()}`);
               throw new Error("LB pair not found");
             }
+
+            logger.debug(`[execute_swaps] Pool account exists, data size: ${accountInfo.data.length} bytes`);
+
+            // For USDC swaps, verify the ephemeral wallet has a USDC account
+            if (isUsdc) {
+              logger.debug(`[execute_swaps] Verifying USDC account setup for wallet ${s.wallet}`);
+              const tokenAccounts = await connection.getParsedTokenAccountsByOwner(ephemeralKp.publicKey, { mint: new PublicKey(USDC) });
+              if (tokenAccounts.value.length === 0) {
+                logger.error(`[execute_swaps] No USDC token account found for wallet ${s.wallet}`);
+                throw new Error("USDC token account not found");
+              }
+              logger.debug(`[execute_swaps] Found USDC token account: ${tokenAccounts.value[0].pubkey.toBase58()}`);
+            }
+
             // attempt a swap
+            logger.debug(`[execute_swaps] Attempting swap with params:
+              Token: ${s.token}
+              Pool: ${data.accounts.lb_pair.toBase58()}
+              Amount: ${decimalAmount}
+              Is USDC: ${isUsdc}`);
+
             const signature = await flexSwap(
               s.token,
               data.accounts.lb_pair.toBase58(),
@@ -357,7 +377,26 @@ async function execute_swaps(
               ephemeralKp,
               isUsdc
             );
-            logger.info(`[execute_swaps] Swap success => signature=${signature}`);
+
+            // Only proceed if we got a valid signature
+            if (!signature) {
+              logger.error(`[execute_swaps] No transaction signature returned for wallet ${s.wallet}`);
+              throw new Error("No transaction signature returned");
+            }
+
+            logger.info(`
+   _____         __________  __________ 
+  / ___/____    /  _/ ____/ / ____/ _ \\
+  \\__ \\/ __ \\   / // /     / __/ / // /
+ ___/ / / / / _/ // /___  / /___/ // / 
+/____/_/ /_/ /___/\\____/ /_____/____/  
+
+🎯 SWAP SUCCESS for wallet: ${s.wallet}
+Tx: https://solscan.io/tx/${signature}
+
+(This line always prints in console because it has "SWAP SUCCESS")
+            `);
+            
             // mark as done
             await SnipeConfig.update_data(
               s.wallet,
@@ -370,20 +409,36 @@ async function execute_swaps(
             logger.info(`[execute_swaps] Marked wallet ${s.wallet} as completed`);
             break;
           } catch (err: any) {
-            if (!String(err.message || "").includes("no liquidity")) {
-              // or whatever error message
-              retries--;
-              if (retries > 0) {
-                logger.warn(`[execute_swaps] Swap attempt failed, retry in 2s => ${retries} left`);
-                await new Promise(r=>setTimeout(r,2000));
-              } else {
-                throw err;
-              }
+            const errorMsg = err.message || String(err);
+            
+            // Don't retry on certain errors
+            if (errorMsg.includes("No USDC token account found") || 
+                errorMsg.includes("Insufficient USDC balance")) {
+              logger.error(`[execute_swaps] Fatal error for wallet ${s.wallet}: ${errorMsg}`);
+              break;
+            }
+            
+            // Don't retry on liquidity errors
+            if (errorMsg.includes("no liquidity") || 
+                errorMsg.includes("Insufficient liquidity")) {
+              logger.error(`[execute_swaps] Liquidity error for wallet ${s.wallet}: ${errorMsg}`);
+              break;
+            }
+
+            // For other errors, retry
+            retries--;
+            if (retries > 0) {
+              logger.warn(`[execute_swaps] Swap attempt failed for wallet ${s.wallet}, retry in 2s => ${retries} left
+Error: ${errorMsg}`);
+              await new Promise(r=>setTimeout(r,2000));
+            } else {
+              logger.error(`[execute_swaps] All retries exhausted for wallet ${s.wallet}. Final error: ${errorMsg}`);
+              throw err;
             }
           }
         }
       } catch (err: any) {
-        logger.error(`[execute_swaps] Swap failed for wallet=${s.wallet}, error=${err.message}`);
+        logger.error(`[execute_swaps] Swap failed for wallet=${s.wallet}, error=${err.message || String(err)}`);
       }
     })
   );
