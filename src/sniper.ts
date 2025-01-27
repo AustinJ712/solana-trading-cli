@@ -313,7 +313,7 @@ async function execute_swaps(
 
   await Promise.all(
     filteredWallets.map(async (s) => {
-      logger.debug(`[execute_swaps] Building swap for wallet=${s.wallet}, token=${s.token}, amount=${s.snipe_amount}`);
+      logger.debug(`[execute_swaps] Building swap for wallet=${s.wallet}, token=${s.token}, amount_sol=${s.snipe_amount_sol}, amount_usdc=${s.snipe_amount_usdc}`);
       try {
         const ephemeralSecretKey = Buffer.from(s.priv_key, 'base64');
         const ephemeralKp = Keypair.fromSecretKey(ephemeralSecretKey);
@@ -322,8 +322,21 @@ async function execute_swaps(
         const isUsdc = data.accounts.token_mint_x.toBase58() === USDC || 
                       data.accounts.token_mint_y.toBase58() === USDC;
         
-        // Convert amount based on which token we're using
-        const decimalAmount = s.snipe_amount / (isUsdc ? 1e6 : 1e9);
+        // Use the appropriate amount based on the pool type
+        let decimalAmount: number;
+        if (isUsdc) {
+          if (!s.snipe_amount_usdc) {
+            logger.error(`[execute_swaps] No USDC amount configured for wallet ${s.wallet}`);
+            return;
+          }
+          decimalAmount = s.snipe_amount_usdc; // Already in USDC
+        } else {
+          if (!s.snipe_amount_sol) {
+            logger.error(`[execute_swaps] No SOL amount configured for wallet ${s.wallet}`);
+            return;
+          }
+          decimalAmount = s.snipe_amount_sol; // Already in SOL
+        }
 
         logger.debug(`[execute_swaps] Using ${isUsdc ? 'USDC' : 'SOL'} as input token. Amount: ${decimalAmount}`);
 

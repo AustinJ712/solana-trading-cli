@@ -20,7 +20,9 @@ import { DateTime } from 'luxon';
 export interface SnipeConfigModel {
   wallet: string;         // The wallet address that will execute the snipe
   priv_key: string;       // Private key of the wallet (stored as base58 string)
-  snipe_amount: number;   // Amount of SOL to spend on the snipe (in lamports)
+  snipe_amount: number;   // Legacy field - to be deprecated
+  snipe_amount_sol: number | null;  // Amount of SOL to spend (in SOL)
+  snipe_amount_usdc: number | null; // Amount of USDC to spend (in USDC)
   token: string;          // Address of the token to snipe
   jito_tip: number;       // Additional tip for Jito MEV searchers (in lamports)
   main_wallet: string;    // The user's main wallet that created this config
@@ -35,7 +37,8 @@ export interface SnipeConfigModel {
  */
 export interface SnipeConfigResponse {
   wallet: string;
-  snipe_amount: number;
+  snipe_amount_sol: number | null;
+  snipe_amount_usdc: number | null;
   token: string;
   main_wallet: string;
   status: number;
@@ -50,7 +53,8 @@ export interface SnipeConfigResponse {
 export function toSnipeConfigResponse(value: SnipeConfigModel): SnipeConfigResponse {
   return {
     wallet: value.wallet,
-    snipe_amount: value.snipe_amount,
+    snipe_amount_sol: value.snipe_amount_sol,
+    snipe_amount_usdc: value.snipe_amount_usdc,
     token: value.token,
     main_wallet: value.main_wallet,
     status: value.status,
@@ -64,10 +68,11 @@ export function toSnipeConfigResponse(value: SnipeConfigModel): SnipeConfigRespo
  * Exactly as in the Rust code with `CreateSnipeConfigRequest`.
  */
 export interface CreateSnipeConfigRequest {
-  main_wallet: string; // User's main wallet address
-  amount: number;      // Amount of SOL to spend (in SOL, not lamports)
-  token: string;       // Token address to snipe
-  jito_tip: number;    // Tip for Jito MEV (in SOL, not lamports)
+  main_wallet: string;    // User's main wallet address
+  amount_sol: number;     // Amount of SOL to spend if it's a SOL pair
+  amount_usdc: number;    // Amount of USDC to spend if it's a USDC pair
+  token: string;         // Token address to snipe
+  jito_tip: number;      // Tip for Jito MEV (in SOL)
 }
 
 export class SnipeConfig {
@@ -82,14 +87,15 @@ export class SnipeConfig {
     // Generate keypair
     const kp = Keypair.generate();
 
-    // Convert SOL to lamports for storage
-    const snipeLamports = Math.floor(request.amount * LAMPORTS_PER_SOL);
+    // Convert SOL to lamports for jito tip
     const jitoLamports = Math.floor(request.jito_tip * LAMPORTS_PER_SOL);
 
     const config: SnipeConfigModel = {
       wallet: kp.publicKey.toBase58(),
-      priv_key: Buffer.from(kp.secretKey).toString('base64'), // or keep as base58
-      snipe_amount: snipeLamports,
+      priv_key: Buffer.from(kp.secretKey).toString('base64'),
+      snipe_amount: Math.floor(request.amount_sol * LAMPORTS_PER_SOL), // Legacy field
+      snipe_amount_sol: request.amount_sol,
+      snipe_amount_usdc: request.amount_usdc,
       token: request.token,
       jito_tip: jitoLamports,
       main_wallet: request.main_wallet,
@@ -98,15 +104,18 @@ export class SnipeConfig {
       executed_at: undefined,
     };
 
-    // Insert into DB
+    // Insert into DB with new columns
     await pool.query(
       `INSERT INTO snipe_config(
-        wallet, priv_key, snipe_amount, token, main_wallet, status, tx_hash, executed_at, jito_tip
-      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        wallet, priv_key, snipe_amount, snipe_amount_sol, snipe_amount_usdc, 
+        token, main_wallet, status, tx_hash, executed_at, jito_tip
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [
         config.wallet,
         config.priv_key,
         config.snipe_amount,
+        config.snipe_amount_sol,
+        config.snipe_amount_usdc,
         config.token,
         config.main_wallet,
         config.status,

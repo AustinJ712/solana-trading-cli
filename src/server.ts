@@ -44,7 +44,8 @@ const insertSnipeConfigHandler: RequestHandler = async (req, res) => {
 
   log('\n📝 Received snipe config insertion request');
   log(`👤 Main Wallet: ${data.main_wallet}`);
-  log(`💰 Amount: ${data.amount} SOL`);
+  log(`💰 SOL Amount: ${data.amount_sol} SOL`);
+  log(`💵 USDC Amount: ${data.amount_usdc} USDC`);
   log(`🪙 Token: ${data.token}`);
   log(`💸 Jito Tip: ${data.jito_tip} SOL`);
 
